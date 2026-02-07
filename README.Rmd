@@ -1,0 +1,310 @@
+---
+title: "README"
+output: github_document
+---
+# Introduction
+This project attempts to develop of classifier to stratify bladder cancer patients by recurrence risk. This file contains the code used to preprocess the data, train the mdoel and produce figures. A 2-page summary of the project can be found in **report.pdf**.
+
+# Data Loading and Quality Control
+
+```{r, echo = TRUE}
+suppressPackageStartupMessages({
+  library(visdat)
+  library(ggplot2)
+})
+
+############ Load UROMOL
+uromol <- readRDS("data/UROMOL_TaLG.teachingcohort.rds")
+
+uromol_demo  <- uromol[setdiff(names(uromol), "exprs")]
+uromol_exprs <- uromol$exprs
+
+############ Load Knowles
+knowles <- readRDS("data/knowles_matched_TaLG_final.rds")
+
+knowles_demo <- knowles[setdiff(names(knowles), "exprs")]
+knowles_exprs <- knowles$exprs
+
+############ Fill in the Knowles RFS_time NAs with latest follow up time for non-reccurrence patients
+idx <- is.na(knowles_demo$RFS_time) & !is.na(knowles_demo$Recurrence) & knowles_demo$Recurrence == 0 
+knowles_demo$RFS_time[idx] <- knowles_demo$FUtime_days.[idx] / 30.44
+
+
+############ Filter out unknown recurrence or no recurrence with less than 2 year follow up
+cutoff_months <- 24 # 2 years
+
+keep_uromol <- with(
+  uromol_demo,
+  !is.na(Recurrence) & (Recurrence == 1 | (Recurrence == 0 & RFS_time >= cutoff_months))
+)
+
+keep_knowles <- with(
+  knowles_demo,
+  !is.na(Recurrence) & (Recurrence == 1 | (Recurrence == 0 & RFS_time >= cutoff_months))
+)
+
+uromol_demo <- uromol_demo[keep_uromol, ]
+uromol_exprs <- uromol_exprs[keep_uromol, ]
+
+knowles_demo <- knowles_demo[keep_knowles, ]
+knowles_exprs <- knowles_exprs[keep_knowles, ]
+
+sprintf("Excluded %d UROMOL patients", sum(!keep_uromol))
+sprintf("Excluded %d Knowles patients", sum(!keep_knowles))
+
+############ Add binary "Recurrence_2yr" column
+uromol_demo$Recurrence_2yr <- factor(
+  as.integer(uromol_demo$Recurrence == 1 & uromol_demo$RFS_time <= cutoff_months),
+  levels = c(0, 1),
+  labels = c("No", "Yes")
+)
+
+knowles_demo$Recurrence_2yr <- factor(
+  as.integer(knowles_demo$Recurrence == 1 & knowles_demo$RFS_time <= cutoff_months),
+  levels = c(0, 1),
+  labels = c("No", "Yes")
+)
+
+############ Only keep intersecting genes from both expression data
+common_genes <- intersect(colnames(uromol_exprs), colnames(knowles_exprs))
+uromol_exprs <- uromol_exprs[, common_genes]
+knowles_exprs  <- knowles_exprs[, common_genes]
+
+############ Select top 4,000 most variable genes using UROMOL only
+gene_var <- apply(uromol_exprs, 2, var)
+top_genes <- names(sort(gene_var, decreasing = TRUE))[1:1000]
+
+############ Subset both cohorts identically
+uromol_exprs  <- uromol_exprs[, top_genes]
+knowles_exprs <- knowles_exprs[, top_genes]
+
+```
+# Model Training
+
+```{r}
+suppressPackageStartupMessages({
+  library(caret)
+})
+
+# Adds age, sex, CIS and BCG variables from the demo_df to the exprs_df
+add_demo <- function(demo_df, exprs_df) {
+  demo_vars <- demo_df[, c("Age", "Sex", "Concomitant.CIS", "BCG")]
+
+  demo_vars$Sex <- factor(demo_vars$Sex)
+  demo_vars$Concomitant.CIS <- factor(demo_vars$Concomitant.CIS)
+  demo_vars$BCG <- factor(demo_vars$BCG)
+  
+  X_rna_demo <- cbind(exprs_df, demo_vars)
+  
+  X_rna_demo
+}
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+uromol_rna_demo <- add_demo(uromol_demo, uromol_exprs)
+uromol_rna_demo$Age[is.na(uromol_rna_demo$Age)] <- median(uromol_rna_demo$Age, na.rm = TRUE) # impute the 3 missing ages
+
+set.seed(42)
+model <- train(
+  Recurrence_2yr ~ ., # Formula interface needed for automatic one-hot encoding
+  data = cbind(uromol_demo["Recurrence_2yr"], uromol_rna_demo),
+  method = "rf",
+  metric = "ROC",
+  trControl = ctrl,
+  preProcess = c("center", "scale")
+)
+
+```
+
+# ROC Curves
+```{r}
+suppressPackageStartupMessages({
+  library(pROC)
+  library(dplyr)
+  library(viridis)
+  library(data.table)
+})
+
+# Get the out of fold predictions corresponding to the best tune from  train object
+oof_preds <- function(model) {
+  bt <- model$bestTune
+  preds <- model$pred
+
+  for (p in names(bt)) {
+    preds <- preds[preds[[p]] == bt[[p]], ]
+  }
+  
+  preds <- preds[order(preds$rowIndex), ] # Match order of demo table
+  
+  preds
+}
+
+uromol_oof <- oof_preds(model)$Yes
+knowles_preds <- caret::predict.train(model, add_demo(knowles_demo, knowles_exprs), type = "prob")[, "Yes"]
+
+roc_list <- list(
+  "UROMOL" = roc(uromol_demo$Recurrence_2yr, uromol_oof, levels = c("No","Yes"), direction = "<"),
+  "Knowles"= roc(knowles_demo$Recurrence_2yr, knowles_preds, levels = c("No","Yes"), direction = "<")
+)
+
+roc_df <- lapply(names(roc_list), function(name) {
+  roc_obj <- roc_list[[name]]
+  dt <- data.table(
+    FPR = 1 - roc_obj$specificities,
+    raw_TPR = roc_obj$sensitivities,
+    Model = name
+  )
+  
+  dt_smooth <- dt[, .(TPR = mean(raw_TPR)), by = .(FPR, Model)]
+  dt_smooth$AUROC <- round(auc(roc_obj), 3)
+  dt_smooth
+}) %>% bind_rows()
+
+roc_plot <- ggplot(roc_df, aes(x = FPR, y = TPR, color = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "ROC Curves",
+    x = "False Positive Rate",
+    y = "True Positive Rate",
+    color = "Model"
+  ) +
+  scale_color_viridis_d(option = "D",
+                     labels = paste0(roc_df %>% group_by(Model) %>% slice(1) %>% pull(Model),
+                                     " (AUC=",
+                                     roc_df %>% group_by(Model) %>% slice(1) %>% pull(AUROC),
+                                     ")")) +
+  theme(legend.position = c(0.95, 0.05),  # x = 0.95, y = 0.05
+      legend.justification = c("right", "bottom"),
+      legend.background = element_rect(fill = "white", color = "black"),
+      plot.title = element_text(hjust = 0.5))
+
+
+roc_plot
+ggsave("figures/roc_plot.png", roc_plot, width = 5, height = 3.5, dpi = 300)
+
+```
+# Kaplan-Meier Curves
+
+```{r}
+suppressPackageStartupMessages({
+  library(survival)
+  library(survminer)
+  library(ggsurvfit)
+})
+
+# Make survival objects
+uromol_surv_obj <- Surv(uromol_demo$RFS_time, uromol_demo$Recurrence)
+knowles_surv_obj <- Surv(knowles_demo$RFS_time, knowles_demo$Recurrence)
+
+# Add new / out of fold predictions for the RNA + Demo model to the data frames
+uromol_demo["OOF_2_YR_RFS_pred"] <- oof_preds(model)$pred
+set.seed(200)
+knowles_demo["OOF_2_YR_RFS_pred"] <- caret::predict.train(model, add_demo(knowles_demo, knowles_exprs))
+
+uromol_km_genomic_risk <- survfit2(uromol_surv_obj ~ OOF_2_YR_RFS_pred, data = uromol_demo) |>
+  ggsurvfit(linewidth = 1) +
+  add_pvalue() +
+  xlim(0, 60) +
+  labs(
+    title = "Genomic Risk KM Curves for UROMOL Cohort",
+    x = "Time (Months)",
+    y = "RFS Probability"
+  ) +
+  scale_color_viridis_d(
+    option = "D",
+    labels = c(
+      "Yes" = "High Genomic Risk",
+      "No"  = "Low Genomic Risk"
+    )) +
+  theme(legend.position = c(0.95, 0.7),  # x = 0.95, y = 0.05
+      legend.justification = c("right", "bottom"),
+      legend.background = element_rect(fill = "white", color = "black"),
+      plot.title = element_text(hjust = 0.5))
+
+knowles_km_genomic_risk <- survfit2(knowles_surv_obj ~ OOF_2_YR_RFS_pred, data = knowles_demo) |>
+  ggsurvfit(linewidth = 1) +
+  add_pvalue() +
+  xlim(0, 60) +
+  labs(
+    title = "Genomic Risk KM Curves for Knowles Cohort",
+    x = "Time (Months)",
+    y = "RFS Probability"
+  ) +
+  scale_color_viridis_d(
+    option = "D",
+    labels = c(
+      "Yes" = "High Genomic Risk",
+      "No"  = "Low Genomic Risk"
+    )) +
+  theme(legend.position = c(0.95, 0.7),  # x = 0.95, y = 0.05
+      legend.justification = c("right", "bottom"),
+      legend.background = element_rect(fill = "white", color = "black"),
+      plot.title = element_text(hjust = 0.5),
+  )
+
+
+uromol_km_genomic_risk
+knowles_km_genomic_risk
+ggsave("figures/uromol_km_genomic_risk.png", uromol_km_genomic_risk, width = 5, height = 3.5, dpi = 300)
+ggsave("figures/knowles_km_genomic_risk.png", knowles_km_genomic_risk, width = 5, height = 3.5, dpi = 300)
+```
+
+# EAU Risk Kaplan-Meier Curves
+```{r}
+
+# Break down the intermediate EAU labels into sub-categories
+uromol_demo <- uromol_demo %>%
+  mutate(
+    EAU_plus_pred = ifelse(
+      EAU.risk == "Intermediate",
+      paste0(EAU.risk, "-", ifelse(OOF_2_YR_RFS_pred == "Yes", "High Genomic Risk", "Low Genomic Risk")),  
+      as.character(EAU.risk)
+    )
+  )
+
+base_eau_curves <- survfit2(uromol_surv_obj ~ EAU.risk, data = uromol_demo) |>
+  ggsurvfit(linewidth = 1) +
+  add_pvalue() +
+  xlim(0, 60) +
+  labs(
+    title = "EAU Risk KM Curves for UROMOL Cohort",
+    x = "Time (Months)",
+    y = "RFS Probability"
+  ) + 
+  scale_color_viridis_d(option = "D", name = "EAU Risk") +
+  theme(legend.position = c(0.97, 0.56), 
+      legend.justification = c("right", "bottom"),
+      legend.background = element_rect(fill = "white", color = "black"),
+      plot.title = element_text(hjust = 0.5))
+
+modified_eau_curves <- survfit2(uromol_surv_obj ~ EAU_plus_pred, data = uromol_demo) |>
+  ggsurvfit(linewidth = 1) +
+  add_pvalue() +
+  xlim(0, 60) +
+  labs(
+    title = "Modified EAU Risk KM Curves for UROMOL Cohort",
+    x = "Time (Months)",
+    y = "RFS Probability"
+  ) +
+  scale_color_viridis_d(option = "D", name = "Modified EAU Risk") +
+  theme(legend.position = c(0.95, 0.6), 
+      legend.justification = c("right", "bottom"),
+      legend.background = element_rect(fill = "white", color = "black"),
+      legend.spacing.y = unit(0.05, "cm"),
+      legend.key.height = unit(0.3, "cm"),
+      plot.title = element_text(hjust = 0.5))
+
+base_eau_curves
+modified_eau_curves
+ggsave("figures/base_eau_curves.png", base_eau_curves, width = 5, height = 3.5, dpi = 300)
+ggsave("figures/modified_eau_curves.png", modified_eau_curves, width = 5, height = 3.5, dpi = 300)
+
+```
