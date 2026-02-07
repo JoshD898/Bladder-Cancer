@@ -3,10 +3,15 @@ README
 
 # Introduction
 
-This project attempts to develop of classifier to stratify bladder
-cancer patients by recurrence risk. This file contains the code used to
+This project attempts to develop a classifier to stratify bladder cancer
+patients by recurrence risk. This file contains the code used to
 preprocess the data, train the model and produce figures. A 2-page
 summary of the project can be found in **report.pdf**.
+
+# How to run
+
+Download and sequentially run all the cells in **README.Rmd** to
+reproduce the model and figures.
 
 # Data Loading and Quality Control
 
