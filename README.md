@@ -10,7 +10,7 @@ summary of the project can be found in **report.pdf**.
 
 # How to run
 
-Download and sequentially run all the cells in **README.Rmd** to
+Clone this repo then sequentially run all the cells in **README.Rmd** to
 reproduce the model and figures.
 
 # Data Loading and Quality Control
