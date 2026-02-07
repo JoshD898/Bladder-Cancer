@@ -3,7 +3,7 @@ title: "README"
 output: github_document
 ---
 # Introduction
-This project attempts to develop of classifier to stratify bladder cancer patients by recurrence risk. This file contains the code used to preprocess the data, train the mdoel and produce figures. A 2-page summary of the project can be found in **report.pdf**.
+This project attempts to develop of classifier to stratify bladder cancer patients by recurrence risk. This file contains the code used to preprocess the data, train the model and produce figures. A 2-page summary of the project can be found in **report.pdf**.
 
 # Data Loading and Quality Control
 
